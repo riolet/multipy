@@ -1,6 +1,5 @@
 #!/usr/bin/python
 import getopt
-import subprocess
 from binascii import hexlify
 import getpass
 import os
@@ -8,9 +7,7 @@ import socket
 import sys
 import traceback
 from paramiko.py3compat import input
-
 import paramiko
-
 
 
 def agent_auth(transport, username):
@@ -34,24 +31,39 @@ def agent_auth(transport, username):
             print('... nope.')
 
 
-def manual_auth(t, username, hostname):
-    default_auth = 'p'
-    auth = input('Auth by (p)assword, (r)sa key, or (d)ss key? [%s] ' % default_auth)
-    if len(auth) == 0:
+def manual_auth(t, username, hostname, key_file):
+
+    default_auth = 'password_auth'
+
+    if len(key_file) == 0:
+        key_file = os.path.join(os.environ['HOME'], '.ssh', 'id_rsa')
+        auth = 'rsa_auth'
+    else:
+        with open('key_file.txt', 'r') as f:
+            first_line = f.readline()
+            if "RSA" in first_line:
+                auth = 'rsa_auth'
+            else:
+                auth = 'dsa_auth'
+
+    if not os.path.isfile(key_file):
+        key_file = os.path.join(os.environ['HOME'], '.ssh', 'id_dsa')
+        auth = 'dsa_auth'
+    else:
+        print "Unable to locate key file. Defaulting to "+auth
         auth = default_auth
 
-    if auth == 'r':
+    if auth == 'rsa_auth':
         default_path = os.path.join(os.environ['HOME'], '.ssh', 'id_rsa')
-        path = input('RSA key [%s]: ' % default_path)
-        if len(path) == 0:
-            path = default_path
+        if len(key_file) == 0:
+            key_file = default_path
         try:
-            key = paramiko.RSAKey.from_private_key_file(path)
+            key = paramiko.RSAKey.from_private_key_file(key_file)
         except paramiko.PasswordRequiredException:
             password = getpass.getpass('RSA key password: ')
-            key = paramiko.RSAKey.from_private_key_file(path, password)
+            key = paramiko.RSAKey.from_private_key_file(key_file, password)
         t.auth_publickey(username, key)
-    elif auth == 'd':
+    elif auth == 'dsa_auth':
         default_path = os.path.join(os.environ['HOME'], '.ssh', 'id_dsa')
         path = input('DSS key [%s]: ' % default_path)
         if len(path) == 0:
@@ -66,33 +78,9 @@ def manual_auth(t, username, hostname):
         pw = getpass.getpass('Password for %s@%s: ' % (username, hostname))
         t.auth_password(username, pw)
 
-def main(argv):
-    print subprocess.Popen("echo Hello World", shell=True, stdout=subprocess.PIPE).stdout.read()
 
-    try:
-        opts, args = getopt.getopt(argv, "hu:c:i:", ["user=", "command=", "key"])
-    except getopt.GetoptError as err:
-        print str(err)
-        print 'multipy.py -u user -c command [-i key]'
-        sys.exit(2)
-    if len(opts) < 1:
-        print 'multipy.py -u user -c command [-i key]'
-        sys.exit(2)
+def multipy(username, command, key_file, stream):
 
-    username = ''
-    command = ''
-    key_file = ''
-    key_section = ''
-    for opt, arg in opts:
-        if opt == '-h':
-            print 'multipy.py -u user -c command -i key'
-            sys.exit()
-        elif opt in ("-u", "--user"):
-            username = arg.strip()
-        elif opt in ("-c", "--command"):
-            command = arg.strip()
-        elif opt in ("-i", "--key"):
-            command = arg.strip()
     # setup logging
     paramiko.util.log_to_file('demo.log')
 
@@ -105,11 +93,9 @@ def main(argv):
             print('*** Unable to open host keys file')
             keys = {}
 
-    for hostname_ in sys.stdin:
+    for hostname_ in stream:
         hostname = hostname_.strip()
         print "Executing "+command+" on "+hostname
-        #print subprocess.Popen("ssh "+key_section+user+"@"+hostname+" -o StrictHostKeyChecking=no \""+command+"\"",
-        #                    shell=True, stdout=subprocess.PIPE).stdout.read()
         if len(hostname) == 0:
             print('*** Hostname required.')
             sys.exit(1)
@@ -134,9 +120,6 @@ def main(argv):
             except paramiko.SSHException:
                 print('*** SSH negotiation failed.')
                 sys.exit(1)
-
-
-
             # check server's host key -- this is important.
             key = t.get_remote_server_key()
             if hostname not in keys:
@@ -158,7 +141,7 @@ def main(argv):
 
             agent_auth(t, username)
             if not t.is_authenticated():
-                manual_auth(t, username, hostname)
+                manual_auth(t, username, hostname, key_file)
             if not t.is_authenticated():
                 print('*** Authentication failed. :(')
                 t.close()
@@ -173,7 +156,7 @@ def main(argv):
             stdout = chan.makefile('r', buf_size)
             stderr = chan.makefile_stderr('r', buf_size)
             for line in stdout:
-                print '... ' + line.strip('\n')
+                print hostname + ':' + line.strip('\n')
             chan.close()
             t.close()
         except Exception as e:
@@ -185,13 +168,34 @@ def main(argv):
                 pass
             sys.exit(1)
 
-            # if key_file:
-            #     key_section = "-i "+key_file
-            #
-            # for host in sys.stdin:
-            #     print "Executing "+command+" on "+host
-            #     print subprocess.Popen("ssh "+key_section+user+"@"+host+" -o StrictHostKeyChecking=no \""+command+"\"",
-            #                        shell=True, stdout=subprocess.PIPE).stdout.read()
+
+def main(argv):
+    try:
+        opts, args = getopt.getopt(argv, "hu:c:i:f:s:", ["user=", "command=", "key=", "file_to_transfer=", "script="])
+    except getopt.GetoptError as err:
+        print str(err)
+        print 'multipy.py -u user [-c command] [-i key] [-s script] [-f file_to_transfer]'
+        sys.exit(2)
+    if len(opts) < 1:
+        print 'multipy.py -u user [-c command] [-i key] [-s script] [-f file_to_transfer]'
+        sys.exit(2)
+
+    username = ''
+    command = ''
+    key_file = ''
+    for opt, arg in opts:
+        if opt == '-h':
+            print 'multipy.py -u user -c command -i key'
+            sys.exit()
+        elif opt in ("-u", "--user"):
+            username = arg.strip()
+        elif opt in ("-c", "--command"):
+            command = arg.strip()
+        elif opt in ("-i", "--key"):
+            key_file = arg.strip()
+
+    multipy(username, command, key_file, sys.stdin)
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
