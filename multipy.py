@@ -10,6 +10,12 @@ from paramiko.py3compat import input
 import paramiko
 from threading import Thread
 from Queue import Queue
+import logging
+
+
+multipy_queue = Queue()
+multipy_logger = logging.getLogger(__name__)
+
 
 def agent_auth(transport, username):
     """
@@ -23,13 +29,13 @@ def agent_auth(transport, username):
         return
 
     for key in agent_keys:
-        print('Trying ssh-agent key %s' % hexlify(key.get_fingerprint()))
+        multipy_logger.info('Trying ssh-agent key %s' % hexlify(key.get_fingerprint()))
         try:
             transport.auth_publickey(username, key)
-            print('... success!')
+            multipy_logger.info('... success!')
             return
         except paramiko.SSHException:
-            print('... nope.')
+            multipy_logger.warn('... nope.')
 
 
 def manual_auth(t, username, hostname, key_file):
@@ -50,7 +56,7 @@ def manual_auth(t, username, hostname, key_file):
         key_file = os.path.join(os.environ['HOME'], '.ssh', 'id_dsa')
         auth = 'dsa_auth'
     else:
-        print "Unable to locate key file. Defaulting to " + auth
+        multipy_logger.warn("Unable to locate key file. Defaulting to " + auth)
         auth = default_auth
 
     if auth == 'rsa_auth':
@@ -79,10 +85,14 @@ def manual_auth(t, username, hostname, key_file):
         t.auth_password(username, pw)
 
 
-def host_action(username, command, key_file, hostname, script_file, files_to_transfer, keys):
-    print "Executing " + command + " on " + hostname
+def host_action(username, command, key_file, hostname, script_file_name, files_to_transfer, keys):
+    if command:
+        multipy_logger.info("Executing " + command + " on " + hostname)
+    else:
+        multipy_logger.info("Executing " + script_file_name + " on " + hostname)
+
     if len(hostname) == 0:
-        print('*** Hostname required.')
+        multipy_logger.error('*** Hostname required.')
         sys.exit(1)
     port = 22
     if hostname.find(':') >= 0:
@@ -94,7 +104,7 @@ def host_action(username, command, key_file, hostname, script_file, files_to_tra
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((hostname, port))
     except Exception as e:
-        print('*** Connect failed: ' + str(e))
+        multipy_logger.error('*** Connect failed: ' + str(e))
         traceback.print_exc()
         sys.exit(1)
 
@@ -103,19 +113,19 @@ def host_action(username, command, key_file, hostname, script_file, files_to_tra
         try:
             t.start_client()
         except paramiko.SSHException:
-            print('*** SSH negotiation failed.')
+            multipy_logger.error('*** SSH negotiation failed.')
             sys.exit(1)
         # check server's host key -- this is important.
         key = t.get_remote_server_key()
         if hostname not in keys:
-            print('*** WARNING: Unknown host key!')
+            multipy_logger.warn('*** WARNING: Unknown host key!')
         elif key.get_name() not in keys[hostname]:
-            print('*** WARNING: Unknown host key!')
+            multipy_logger.warn('*** WARNING: Unknown host key!')
         elif keys[hostname][key.get_name()] != key:
-            print('*** WARNING: Host key has changed!!!')
+            multipy_logger.error('*** WARNING: Host key has changed!!!')
             sys.exit(1)
         else:
-            print('*** Host key OK.')
+            multipy_logger.info('*** Host key OK.')
 
         # get username
         if username == '':
@@ -132,20 +142,41 @@ def host_action(username, command, key_file, hostname, script_file, files_to_tra
             t.close()
             sys.exit(1)
 
+        multipy_logger.info(hostname + ': Opening session')
         chan = t.open_session()
         buf_size = -1
         timeout = None
         chan.settimeout(timeout)
-        chan.exec_command(command)
+        command_lines = []
+
         stdin = chan.makefile('wb', buf_size)
         stdout = chan.makefile('r', buf_size)
         stderr = chan.makefile_stderr('r', buf_size)
-        for line in stdout:
-            print hostname + ':' + line.strip('\n')
+
+        if command:
+            command_lines.append(command+"\n")
+        else:
+            with open(script_file_name) as script_file:
+                command_lines = script_file.readlines()
+
+        chan.invoke_shell()
+        for command_line in command_lines:
+            multipy_logger.info(hostname + ':' + command_line)
+            chan.send(command_line)
+            multipy_logger.info(hostname + ':sent')
+
+            buff = chan.recv(1024)
+            while chan.recv_ready():
+                resp = chan.recv(1024)
+                buff += resp
+            multipy_logger.info(hostname + ':\n' + buff)
+
+
         chan.close()
         t.close()
+
     except Exception as e:
-        print('*** Caught exception: ' + str(e.__class__) + ': ' + str(e))
+        multipy_logger.error('*** Caught exception: ' + str(e.__class__) + ': ' + str(e))
         traceback.print_exc()
         try:
             t.close()
@@ -153,8 +184,6 @@ def host_action(username, command, key_file, hostname, script_file, files_to_tra
             pass
         sys.exit(1)
 
-
-multipy_queue = Queue()
 
 def multipy_worker():
     while True:
@@ -164,9 +193,14 @@ def multipy_worker():
         multipy_queue.task_done()
 
 
-def multipy(username, command, key_file, stream, script_file, files_to_transfer, maxthreads):
+def multipy(username, command, key_file, stream, script_file, files_to_transfer, max_threads, verbosity):
     # setup logging
-    paramiko.util.log_to_file('demo.log')
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    multipy_logger.addHandler(ch)
+
+    if verbosity > 0:
+        multipy_logger.setLevel(verbosity)
 
     try:
         keys = paramiko.util.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
@@ -174,38 +208,38 @@ def multipy(username, command, key_file, stream, script_file, files_to_transfer,
         try:
             keys = paramiko.util.load_host_keys(os.path.expanduser('~/ssh/known_hosts'))
         except IOError:
-            print('*** Unable to open host keys file')
+            multipy_logger.error('*** Unable to open host keys file')
             keys = {}
 
-    if maxthreads > 0:
-        for i in range(maxthreads):
+    if max_threads > 0:
+        for i in range(max_threads):
             t = Thread(target=multipy_worker)
             t.daemon = True
             t.start()
 
     for hostname_ in stream:
         hostname = hostname_.strip()
-        if maxthreads > 0:
+        if max_threads > 0:
             multipy_queue.put({"username": username, "command": command, "key_file": key_file,
                    "hostname": hostname, "script_file": script_file,
                    "files_to_transfer": files_to_transfer, "keys": keys})
         else:
             host_action(username, command, key_file, hostname, script_file, files_to_transfer, keys)
 
-    if maxthreads > 0:
+    if max_threads > 0:
         multipy_queue.join()
 
 
 def usage():
-    print 'multipy.py -u user [-c command] [-i key] [-s script] [-f files,to,transfer] -t threads'
+    print 'multipy.py -u user [-c command] [-i key] [-s script] [-f files,to,transfer] -t threads -v verbosity'
     sys.exit(2)
 
 
 def main(argv):
     try:
         opts, args = getopt.getopt(argv,
-                                   "hu:c:i:f:s:t:",
-                                   ["user=", "command=", "key=", "files=", "script=", "threads="])
+                                   "hu:c:i:f:s:t:v:",
+                                   ["user=", "command=", "key=", "files=", "script=", "threads=", "verbosity="])
     except getopt.GetoptError as err:
         print str(err)
         usage()
@@ -217,7 +251,8 @@ def main(argv):
     key_file = ''
     script_file = ''
     files_to_transfer = ''
-    maxthreads = 0
+    max_threads = 0
+    verbosity = 1
     for opt, arg in opts:
         if opt == '-h':
             usage()
@@ -233,16 +268,19 @@ def main(argv):
         elif opt in ("-f", "--files"):
             files_to_transfer = arg.strip()
         elif opt in ("-t", "--threads"):
-            maxthreads = int(arg.strip())
+            max_threads = int(arg.strip())
+        elif opt in ("-v", "--verbosity"):
+            verbosity = int(arg.strip())
+
     if not username:
         print 'Username required'
         usage()
 
-    if not (command and script_file):
+    if not (command or script_file):
         print 'Command or script required'
         usage()
 
-    multipy(username, command, key_file, sys.stdin, script_file, files_to_transfer, maxthreads)
+    multipy(username, command, key_file, sys.stdin, script_file, files_to_transfer, max_threads, verbosity)
 
 
 if __name__ == "__main__":
