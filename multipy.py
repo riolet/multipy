@@ -85,7 +85,7 @@ def manual_auth(t, username, hostname, key_file):
         t.auth_password(username, pw)
 
 
-def host_action(username, command, key_file, hostname, script_file_name, files_to_transfer, keys):
+def host_action(username, command, key_file, hostname, script_file_name, files_to_transfer, keys, match):
     if command:
         multipy_logger.info("Executing " + command + " on " + hostname)
     else:
@@ -160,16 +160,19 @@ def host_action(username, command, key_file, hostname, script_file_name, files_t
                 command_lines = script_file.readlines()
 
         chan.invoke_shell()
+        multipy_logger.info("Match "+match)
         for command_line in command_lines:
+
             multipy_logger.info(hostname + ':' + command_line)
             chan.send(command_line)
-            multipy_logger.info(hostname + ':sent')
 
             buff = chan.recv(1024)
             while chan.recv_ready():
                 resp = chan.recv(1024)
                 buff += resp
-            multipy_logger.info(hostname + ':\n' + buff)
+
+            if not match or (match in buff):
+                print hostname + ':\n' + buff
 
 
         chan.close()
@@ -189,11 +192,11 @@ def multipy_worker():
     while True:
         item = multipy_queue.get()
         host_action(item['username'], item['command'], item['key_file'], item['hostname'],
-                    item['script_file'], item['files_to_transfer'], item['keys'])
+                    item['script_file'], item['files_to_transfer'], item['keys'], item['match'])
         multipy_queue.task_done()
 
 
-def multipy(username, command, key_file, stream, script_file, files_to_transfer, max_threads, verbosity):
+def multipy(username, command, key_file, stream, script_file, files_to_transfer, max_threads, verbosity, match):
     # setup logging
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG)
@@ -222,7 +225,7 @@ def multipy(username, command, key_file, stream, script_file, files_to_transfer,
         if max_threads > 0:
             multipy_queue.put({"username": username, "command": command, "key_file": key_file,
                    "hostname": hostname, "script_file": script_file,
-                   "files_to_transfer": files_to_transfer, "keys": keys})
+                   "files_to_transfer": files_to_transfer, "keys": keys, "match": match})
         else:
             host_action(username, command, key_file, hostname, script_file, files_to_transfer, keys)
 
@@ -231,15 +234,17 @@ def multipy(username, command, key_file, stream, script_file, files_to_transfer,
 
 
 def usage():
-    print 'multipy.py -u user [-c command] [-i key] [-s script] [-f files,to,transfer] -t threads -v verbosity'
+    print 'multipy.py -u user [-c command] [-i key] [-s script]\
+        [-f files,to,transfer] [-t threads] [-v verbosity] [-g grep]'
     sys.exit(2)
 
 
 def main(argv):
     try:
         opts, args = getopt.getopt(argv,
-                                   "hu:c:i:f:s:t:v:",
-                                   ["user=", "command=", "key=", "files=", "script=", "threads=", "verbosity="])
+                                   "hu:c:i:f:s:t:v:m:",
+                                   ["user=", "command=", "key=", "files=", "script=",
+                                    "threads=", "verbosity=", "match="])
     except getopt.GetoptError as err:
         print str(err)
         usage()
@@ -253,6 +258,7 @@ def main(argv):
     files_to_transfer = ''
     max_threads = 0
     verbosity = 1
+    match = ''
     for opt, arg in opts:
         if opt == '-h':
             usage()
@@ -271,7 +277,8 @@ def main(argv):
             max_threads = int(arg.strip())
         elif opt in ("-v", "--verbosity"):
             verbosity = int(arg.strip())
-
+        elif opt in ("-m", "--match"):
+            match = arg.strip()
     if not username:
         print 'Username required'
         usage()
@@ -280,7 +287,7 @@ def main(argv):
         print 'Command or script required'
         usage()
 
-    multipy(username, command, key_file, sys.stdin, script_file, files_to_transfer, max_threads, verbosity)
+    multipy(username, command, key_file, sys.stdin, script_file, files_to_transfer, max_threads, verbosity, match)
 
 
 if __name__ == "__main__":
